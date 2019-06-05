@@ -112,7 +112,7 @@ void usage()
       " -s           1 transfer, then exit\n"
       " -z           enable 0dm eigenzapping\n"
       " -D           path to eigen-zap file [default: ./out.eig]\n"
-      " -m           do not create monitoring statistics\n"
+      " -m           create monitoring statistics\n"
       " -h           show help\n"
       " in_key       DADA key for input data block\n"
       " out_key      DADA key for output data block\n");
@@ -168,12 +168,13 @@ typedef struct {
   int * eigs_zapped;
   int write_monitoring;
   FILE * eigs_zapped_file;
-  char eigs_zapped_path[1024];
+  FILE * eigs_zapped_file_0dm;
   char order[4];
+  char eigs_zapped_path[1024];
   dbsvddb_work_t work;
 } dbsvddb_t;
 
-#define DADA_DBNUM_INIT {{0},0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,"0","0",{0}}
+#define DADA_DBNUM_INIT {{0},0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,"0","0",{0}}
 
 
 
@@ -197,9 +198,10 @@ int main(int argc, char* argv[])
   float thresh = 1.3;
   sprintf(dbsvddb.eigs_zapped_path,"out.eig");
 
+
   int arg = 0;
 
-  int write_monitoring = 1;
+  int write_monitoring = 0;
   
   while ((arg=getopt(argc,argv,"p:n:t:D:zmdvVs")) != -1)
   {
@@ -245,7 +247,7 @@ int main(int argc, char* argv[])
           break;
 
       case 'm':
-        write_monitoring = 0;
+        write_monitoring = 1;
         break;
 
       case 'z':
@@ -511,29 +513,25 @@ int dbsvddb_open(dada_client_t* client)
   }
 
 
-  //if (ctx->write_monitoring)
-  //{
-  //  if (getcwd(eigs_zapped_path, sizeof(eigs_zapped_path)) == NULL)
-  //  {
-  //    multilog(log, LOG_WARNING, "open: couldn't get current working directory\n");
-  //    ctx->write_monitoring = 0;
-  //  }
-  //}
-
   char utc_start[64];
 
   if (ctx->write_monitoring)
   {
-    //if (ascii_header_get(client->header, "UTC_START", "%s", &(utc_start)) != 1)
-    //{
-    // multilog(log, LOG_WARNING, "open: header with no UTC_START\n");
-    //  sprintf(eigs_zapped_path,"%s/monitoring.eig",eigs_zapped_path);
-    //}
-    //else
-    //  sprintf(eigs_zapped_path,"%s/%s.eig",eigs_zapped_path,utc_start);
 
     ctx->eigs_zapped_file = fopen(ctx->eigs_zapped_path, "w");
     if (ctx->eigs_zapped_file == NULL)
+    {
+      multilog(log, LOG_ERR, "open: could not open %s for writting\n", ctx->eigs_zapped_path);
+      ctx->write_monitoring = 0;
+    }
+
+    if (ctx->verbose)
+      multilog(log, LOG_INFO, "open: opened %s for writting\n", ctx->eigs_zapped_path);
+
+    sprintf(ctx->eigs_zapped_path, "%s.0dm", ctx->eigs_zapped_path);
+    ctx->eigs_zapped_file_0dm = fopen(ctx->eigs_zapped_path, "w");
+
+    if (ctx->eigs_zapped_file_0dm == NULL)
     {
       multilog(log, LOG_ERR, "open: could not open %s for writting\n", ctx->eigs_zapped_path);
       ctx->write_monitoring = 0;
@@ -641,6 +639,7 @@ int dbsvddb_close(dada_client_t* client, uint64_t bytes_written)
       multilog(log, LOG_INFO, "close: closing monitoring file\n");
 
     fclose(ctx->eigs_zapped_file);
+    fclose(ctx->eigs_zapped_file_0dm);
   }
 
   // close the block if it is open
@@ -758,7 +757,7 @@ int64_t dbsvddb_io_block(dada_client_t* client, void* in_data, uint64_t data_siz
   if (ctx->verbose)
     multilog(log, LOG_INFO, "Starting SVD; nrows: %lu, ncols: %lu\n",nrows,ncols);
 
-  int neig;
+  int neig, neig0dm;
   int ERR = 0;
 
   //FILE* fp = fopen("./eig.out","a");
@@ -833,10 +832,11 @@ int64_t dbsvddb_io_block(dada_client_t* client, void* in_data, uint64_t data_siz
 
     // DM0 frequency scrunch
     dbsvddb_dm0_scr(client);
-    for (i=0; i<ctx->nsamples; i++)
-      fprintf(stderr, "%f ", ctx->work.dm0ts[i]);
-    fprintf(stderr,"\n");
-    dbsvddb_do_svd(client, ctx->work.dm0ts, nproc, nrows, ncols,
+
+    // Copy the data temporarly (SVD destroys input data)
+    memcpy(data[0], ctx->work.dm0ts, nrows*ncols* sizeof *ctx->work.dm0ts);
+    // Run SVD on temporary pointer
+    dbsvddb_do_svd(client, data[0], nproc, nrows, ncols,
         jobu, jobvt, lddata, ldu, ldvt);
 
 
@@ -853,24 +853,18 @@ int64_t dbsvddb_io_block(dada_client_t* client, void* in_data, uint64_t data_siz
           ncols, jobu, jobvt, lddata, ldu, ldvt);
 
       // Find how many eigenvectors to zap
-      neig = dbsvddb_get_neig(W[nproc], ctx->nW, ctx->min_neig, ctx->thresh);
-      neig = 1;
+      neig0dm = dbsvddb_get_neig(W[nproc], ctx->nW, ctx->min_neig, ctx->thresh);
 
       if (ctx->verbose > 1)
         multilog(log, LOG_INFO, "Removing the first %i eigenvectors from 0DM\n",
-            neig);
+            neig0dm);
 
       // Keep the first k eigenvectors
-      keep_first_k_eig(U[nproc], Vt[nproc], neig, nrows, ncols);
+      keep_first_k_eig(U[nproc], Vt[nproc], neig0dm, nrows, ncols);
 
       // Projecting back
       dbsvddb_unproj_pc(client, ctx->work.dm0ts, nproc, nrows,
           ncols, jobu, jobvt, lddata, ldu, ldvt);
-      for (i=0; i<ctx->nsamples; i++)
-        fprintf(stderr, "%f ", ctx->work.dm0ts[i]);
-      fprintf(stderr,"\n");
-      fprintf(stderr,"\n");
-      char tmp = getchar();
 
       // Subtract from each channel
       dbsvddb_subtract_0dm(client);
@@ -879,7 +873,11 @@ int64_t dbsvddb_io_block(dada_client_t* client, void* in_data, uint64_t data_siz
 
   // Write monitoring statistics
   if (ctx->write_monitoring)
+  {
     fwrite(ctx->eigs_zapped, sizeof *(ctx->eigs_zapped), nchans, ctx->eigs_zapped_file);
+    if (ctx->zap0dm)
+      putc(neig0dm, ctx->eigs_zapped_file_0dm);
+  }
 
   // Write data to output buffer
   uint64_t out_block_id;
@@ -1422,7 +1420,6 @@ static inline void dbsvddb_dm0_scr(dada_client_t* client)
   dbsvddb_t* ctx = (dbsvddb_t*) client->context;
 
   uint64_t ichan, ibeam, isamp;
-  char tmp;
 
   memset(ctx->work.dm0ts, 0., 
       ctx->nsamples*ctx->nbeams*sizeof *ctx->work.dm0ts);
