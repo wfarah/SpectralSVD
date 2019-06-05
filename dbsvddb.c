@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  *
- *       Filename:  mopsr_dbsvddb.c
+ *       Filename:  dbsvddb.c
  *
  *    Description:  Performs SVD based RFI cleaning 
  *
@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <time.h>
+#include <math.h>
 
 #include "mkl.h"
 
@@ -68,7 +69,6 @@ typedef float w_dtype;
 typedef float io_dtype;
 
 
-int get_data(char*, uint64_t, uint64_t, uint64_t, w_dtype**);
 int dbsvddb_open(dada_client_t*);
 int dbsvddb_close(dada_client_t*, uint64_t);
 int64_t dbsvddb_write(dada_client_t*, void*, uint64_t);
@@ -80,19 +80,37 @@ int dbsvddb_transpose_SFT_FST(void *, w_dtype**, uint64_t, uint64_t, uint64_t);
 int dbsvddb_transpose_STF_FST(void *, w_dtype**, uint64_t, uint64_t, uint64_t);
 int dbsvddb_write_FST_SFT(char*, w_dtype*, uint64_t, uint64_t, uint64_t);
 int dbsvddb_write_FST_STF(char*, w_dtype*, uint64_t, uint64_t, uint64_t);
+
+void dbsvddb_do_svd(dada_client_t* client, w_dtype* data, int nproc,
+    int nrows, int ncols, char jobu, char jobvt,
+    lapack_int lddata, lapack_int ldu, lapack_int ldvt);
+void dbsvddb_proj_pc(dada_client_t* client, w_dtype* outdata, int nproc,
+    int nrows, int ncols, char jobu, char jobvt,
+    lapack_int lddata, lapack_int ldu, lapack_int ldvt);
+void dbsvddb_unproj_pc(dada_client_t* client, w_dtype* outdata, int nproc,
+    int nrows, int ncols, char jobu, char jobvt,
+    lapack_int lddata, lapack_int ldu, lapack_int ldvt);
+
+static inline void dbsvddb_dm0_scr(dada_client_t* client);
+static inline void dbsvddb_subtract_0dm(dada_client_t* client);
+
+void zero_first_k_eig(w_dtype* U, w_dtype* Vt, int neig, int nrows, int ncols);
+void keep_first_k_eig(w_dtype* U, w_dtype* Vt, int neig, int nrows, int ncols);
+
 static inline int dbsvddb_get_neig(w_dtype*, int, int, float);
 
 
 void usage()
 {
   fprintf(stdout,
-      "mopsr_dbsvddb [options] in_key out_key\n"
+      "dbsvddb [options] in_key out_key\n"
       " -p [nprocs]  number of processes to spawn [default: 1]\n"
       " -n [neig]    minimum number of eigenvectors to keep in input data [default: 5]\n"
       " -t [thresh]  rejection threshold used for eigenvalue ratios [default: 1.3]\n"
       " -d           daemonize\n"
       " -vV          increase verbosity mode\n"
       " -s           1 transfer, then exit\n"
+      " -z           enable 0dm eigenzapping\n"
       " -D           path to eigen-zap file [default: ./out.eig]\n"
       " -m           do not create monitoring statistics\n"
       " -h           show help\n"
@@ -108,7 +126,7 @@ typedef struct {
   uint64_t       bytes_written;
   unsigned       block_open;
   char*          curr_block;
-} mopsr_dbsvddb_hdu_t;
+} dbsvddb_hdu_t;
 
 
 typedef struct {
@@ -119,12 +137,13 @@ typedef struct {
   w_dtype **PC;
   w_dtype **data;
   w_dtype *outdata;
+  w_dtype *dm0ts;
   lapack_int *info;
   lapack_int lwork;
-} mopsr_dbsvddb_work_t;
+} dbsvddb_work_t;
 
 typedef struct {
-  mopsr_dbsvddb_hdu_t output;
+  dbsvddb_hdu_t output;
 
   uint64_t bytes_in;
 
@@ -139,6 +158,7 @@ typedef struct {
 
   int min_neig;
   float thresh;
+  int zap0dm;
 
   unsigned int nbit;
 
@@ -150,16 +170,16 @@ typedef struct {
   FILE * eigs_zapped_file;
   char eigs_zapped_path[1024];
   char order[4];
-  mopsr_dbsvddb_work_t work;
-} mopsr_dbsvddb_t;
+  dbsvddb_work_t work;
+} dbsvddb_t;
 
-#define DADA_DBNUM_INIT {{0},0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,"0","0",{0}}
+#define DADA_DBNUM_INIT {{0},0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,"0","0",{0}}
 
 
 
 int main(int argc, char* argv[])
 {
-  mopsr_dbsvddb_t dbsvddb = DADA_DBNUM_INIT;
+  dbsvddb_t dbsvddb = DADA_DBNUM_INIT;
 
   dada_hdu_t* in_hdu = 0;
   
@@ -181,7 +201,7 @@ int main(int argc, char* argv[])
 
   int write_monitoring = 1;
   
-  while ((arg=getopt(argc,argv,"p:n:t:mdvVs")) != -1)
+  while ((arg=getopt(argc,argv,"p:n:t:D:zmdvVs")) != -1)
   {
     switch (arg)
     {
@@ -226,6 +246,10 @@ int main(int argc, char* argv[])
 
       case 'm':
         write_monitoring = 0;
+        break;
+
+      case 'z':
+        dbsvddb.zap0dm = 1;
         break;
 
       case 'd':
@@ -287,11 +311,12 @@ int main(int argc, char* argv[])
   {
     fprintf(stderr,"Using min_neig: %i\n", min_neig);
     fprintf(stderr,"Using threshold: %f\n", thresh);
+    if (dbsvddb.zap0dm)
+      fprintf(stderr,"Performing 0DM zapping\n");
   }
   dbsvddb.min_neig = min_neig;
   dbsvddb.thresh = thresh;
   dbsvddb.write_monitoring = write_monitoring;
-  fprintf(stderr,"WRITE MONITOR %i\n",dbsvddb.write_monitoring);
 
   if(dbsvddb.verbose)
   {
@@ -310,7 +335,7 @@ int main(int argc, char* argv[])
 
 
   multilog_t* log = 0;
-  log = multilog_open("mopsr_dbsvddb",0);
+  log = multilog_open("dbsvddb",0);
   multilog_add (log,stderr);
 
 
@@ -350,7 +375,9 @@ int main(int argc, char* argv[])
 
   if (in_block_size != dbsvddb.output.block_size)
   {
-    multilog(log, LOG_ERR, "Input datablock size != output datablock size; this mode is not supported. Terminating\n");
+    multilog(log, LOG_ERR, "Input datablock size (%"PRIu64")\
+        != output datablock size (%"PRIu64"); this mode is not supported.\
+        Terminating\n",in_block_size,dbsvddb.output.block_size);
     return -1;
   }
 
@@ -424,32 +451,10 @@ int main(int argc, char* argv[])
 }
 
 
-int get_data(char* fname, uint64_t nrows, 
-    uint64_t ncols, uint64_t nchans, w_dtype** buffer)
-{
-  FILE* fp = fopen(fname,"r");
-  size_t nread;
-  nread = fread(buffer[0], sizeof(w_dtype), nrows*ncols, fp);
-  if (nread != nrows*ncols)
-  {
-    fprintf(stderr,"ERROR: get_data. Read only %lu, expected %lu\n", 
-        nread, nrows*ncols);
-    return -1;
-  }
-  fclose(fp);
-
-  unsigned i;
-  for(i=1; i<nchans; i++)
-  {
-    memcpy(buffer[i], buffer[0], nrows*ncols*sizeof *buffer[0]);
-  }
-
-  return 0;
-}
 
 int dbsvddb_open(dada_client_t* client)
 {
-  mopsr_dbsvddb_t* ctx = (mopsr_dbsvddb_t *) client->context;
+  dbsvddb_t* ctx = (dbsvddb_t *) client->context;
 
   multilog_t* log = client->log;
 
@@ -600,7 +605,7 @@ int dbsvddb_open(dada_client_t* client)
 
 int64_t dbsvddb_write(dada_client_t* client, void* data, uint64_t data_size)
 {
-  mopsr_dbsvddb_t* ctx = (mopsr_dbsvddb_t*) client->context;
+  dbsvddb_t* ctx = (dbsvddb_t*) client->context;
 
   multilog_t* log = client->log;
 
@@ -622,7 +627,7 @@ int64_t dbsvddb_write(dada_client_t* client, void* data, uint64_t data_size)
 
 int dbsvddb_close(dada_client_t* client, uint64_t bytes_written)
 {
-  mopsr_dbsvddb_t* ctx = (mopsr_dbsvddb_t*) client->context;
+  dbsvddb_t* ctx = (dbsvddb_t*) client->context;
 
   multilog_t* log = client->log;
 
@@ -670,7 +675,7 @@ int dbsvddb_close(dada_client_t* client, uint64_t bytes_written)
 
 int64_t dbsvddb_io_block(dada_client_t* client, void* in_data, uint64_t data_size, uint64_t block_id)
 {
-  mopsr_dbsvddb_t* ctx = (mopsr_dbsvddb_t*) client->context;
+  dbsvddb_t* ctx = (dbsvddb_t*) client->context;
 
   multilog_t * log = client->log;
 
@@ -702,8 +707,6 @@ int64_t dbsvddb_io_block(dada_client_t* client, void* in_data, uint64_t data_siz
 
 
   unsigned nproc, ichan, i,j;
-  float alpha, beta;
-  alpha = 1.0; beta = 0.;
 
   // unpack pointers, make my life easier
   w_dtype **U = ctx->work.U;
@@ -713,6 +716,7 @@ int64_t dbsvddb_io_block(dada_client_t* client, void* in_data, uint64_t data_siz
   w_dtype **PC = ctx->work.PC;
   w_dtype **data = ctx->work.data;
   w_dtype *outdata = ctx->work.outdata;
+  w_dtype *dm0ts = ctx->work.dm0ts;
   lapack_int *info = ctx->work.info;
 
   lapack_int lddata, ldu, ldvt;
@@ -784,23 +788,8 @@ int64_t dbsvddb_io_block(dada_client_t* client, void* in_data, uint64_t data_siz
     if (ERR)
       continue;
 
-#ifdef USEDOUBLE
-    info[nproc] = LAPACKE_dgesvd_work(LAPACK_ROW_MAJOR, jobu, jobvt,
-        nrows, ncols, data[ichan], lddata,
-        W[nproc], U[nproc], ldu, 
-        Vt[nproc], ldvt, superb[nproc], ctx->work.lwork);
-//    LAPACK_dgesvd(&jobu, &jobvt, &nrows, &ncols, data[ichan],
-//        &lddata, W[nproc], U[nproc], &ldu, Vt[nproc],
-//        &ldvt, superb[nproc], &(ctx->work.lwork), &info[nproc]);
-#else
-    info[nproc] = LAPACKE_sgesvd_work(LAPACK_ROW_MAJOR, jobu, jobvt,
-        nrows, ncols, data[ichan], lddata,
-        W[nproc], U[nproc], ldu, 
-        Vt[nproc], ldvt, superb[nproc], ctx->work.lwork);
-//    LAPACK_sgesvd(&jobu, &jobvt, &nrows, &ncols, data[ichan],
-//        &lddata, W[nproc], U[nproc], &ldu, Vt[nproc],
-//        &ldvt, superb[nproc], &(ctx->work.lwork), &info[nproc]);
-#endif
+    // Doing SVD on each channel
+    dbsvddb_do_svd(client, data[ichan], nproc, nrows, ncols, jobu, jobvt, lddata, ldu, ldvt);
 
     if (info[nproc] != 0)
     {
@@ -813,122 +802,80 @@ int64_t dbsvddb_io_block(dada_client_t* client, void* in_data, uint64_t data_siz
     if (ctx->verbose > 1)
       multilog(log, LOG_INFO, "Process: %i, ichan: %i, performing SVD\n",
           nproc,ichan);
-    // Compute Principal Components
-    if (nrows<ncols)
-    { 
-    // PC = dot(U.T,data)
-#ifdef USEDOUBLE
-      cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-          nrows, ncols, MIN(nrows,ncols), alpha, U[nproc], ldu,
-          &(outdata[ichan*nrows*ncols]),lddata,beta,
-          PC[nproc],lddata);
-#else
-      cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-          nrows, ncols, MIN(nrows,ncols), alpha, U[nproc], ldu,
-          &(outdata[ichan*nrows*ncols]),lddata,beta,
-          PC[nproc],lddata);
-#endif
 
-    }
-    else
-    {
-    // PC = dot(data,Vt.T) = dot(data,V)
-#ifdef USEDOUBLE
-      cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-          nrows, ncols, MIN(nrows,ncols), alpha, 
-          &(outdata[ichan*nrows*ncols]), lddata,
-          Vt[nproc],ldvt,beta,PC[nproc],lddata);
-#else
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-          nrows, ncols, MIN(nrows,ncols), alpha, 
-          &(outdata[ichan*nrows*ncols]), lddata,
-          Vt[nproc],ldvt,beta,PC[nproc],lddata);
-#endif
-    }
+    // Projecting to produce principal components
+    dbsvddb_proj_pc(client, &(outdata[ichan*nrows*ncols]), nproc, nrows, 
+        ncols, jobu, jobvt, lddata, ldu, ldvt);
+
     if (ctx->verbose > 1)
       multilog(log, LOG_INFO,"Process: %i, ichan: %i, SVD done\n",
           nproc,ichan);
 
-//    for(i=0; i<ctx->nW; i++)
-//      fprintf(stderr, "%f ", W[nproc+i]);
-//    fprintf(stderr, "\n");
-//    int tmptmp;
-//    tmptmp = getchar ();
     // Find how many eigenvectors to zap
     neig = dbsvddb_get_neig(W[nproc], ctx->nW, ctx->min_neig, ctx->thresh);
     ctx->eigs_zapped[ichan] = neig;
 
-    // Zeroing the first k eigenvectors (first k columns of U)
-    // (Or first k columns of Vt.T, i.e. first k rows of V)
-    for(i=0; i<MIN(nrows,ncols); i++)
-    {
-      for(j=0; j<neig; j++)
-      {
-        if (nrows<ncols)
-        {
-          U[nproc][i*MIN(nrows,ncols) + j] = 0.0;
-        }
-        else
-        {
-          Vt[nproc][j*MIN(nrows,ncols) + i] = 0.0;
-        }
-      }
-    }
+    // Zeroing the first k eigenvectors
+    zero_first_k_eig(U[nproc], Vt[nproc], neig, nrows, ncols);
 
     // Projecting back
-    if (nrows<ncols)
+    dbsvddb_unproj_pc(client, &(outdata[ichan*nrows*ncols]), nproc, nrows, 
+        ncols, jobu, jobvt, lddata, ldu, ldvt);
+
+  }
+
+  if (ctx->zap0dm)
+  {
+    nproc = 0; // use the first proc
+
+    if (ctx->verbose > 1)
+      multilog(log, LOG_INFO, "Performing 0DM SVD\n");
+
+    // DM0 frequency scrunch
+    dbsvddb_dm0_scr(client);
+    for (i=0; i<ctx->nsamples; i++)
+      fprintf(stderr, "%f ", ctx->work.dm0ts[i]);
+    fprintf(stderr,"\n");
+    dbsvddb_do_svd(client, ctx->work.dm0ts, nproc, nrows, ncols,
+        jobu, jobvt, lddata, ldu, ldvt);
+
+
+    if (info[nproc] != 0)
     {
-    // outdata = dot(U,data)
-#ifdef USEDOUBLE
-      cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-          nrows, ncols, MIN(nrows,ncols), alpha, U[nproc], ldu,
-          PC[nproc], lddata, beta, &outdata[ichan*nrows*ncols], lddata);
-#else
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-          nrows, ncols, MIN(nrows,ncols), alpha, U[nproc], ldu,
-          PC[nproc], lddata, beta, &outdata[ichan*nrows*ncols], lddata);
-#endif
+      multilog(log, LOG_ERR, "ERROR in SVD: (%i), when 0DM zapping", 
+          info[nproc]);
+      ERR += 1;
     }
     else
     {
-    // outdata = dot(Y, Vt)
-#ifdef USEDOUBLE
-      cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-          nrows, ncols, MIN(nrows,ncols), alpha, PC[nproc], lddata,
-          Vt[nproc], ldvt, beta, &outdata[ichan*nrows*ncols], lddata);
-#else
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-          nrows, ncols, MIN(nrows,ncols), alpha, PC[nproc], lddata,
-          Vt[nproc], ldvt, beta, &outdata[ichan*nrows*ncols], lddata);
-#endif
+      // Projecting to produce principal components
+      dbsvddb_proj_pc(client, ctx->work.dm0ts, nproc, nrows, 
+          ncols, jobu, jobvt, lddata, ldu, ldvt);
+
+      // Find how many eigenvectors to zap
+      neig = dbsvddb_get_neig(W[nproc], ctx->nW, ctx->min_neig, ctx->thresh);
+      neig = 1;
+
+      if (ctx->verbose > 1)
+        multilog(log, LOG_INFO, "Removing the first %i eigenvectors from 0DM\n",
+            neig);
+
+      // Keep the first k eigenvectors
+      keep_first_k_eig(U[nproc], Vt[nproc], neig, nrows, ncols);
+
+      // Projecting back
+      dbsvddb_unproj_pc(client, ctx->work.dm0ts, nproc, nrows,
+          ncols, jobu, jobvt, lddata, ldu, ldvt);
+      for (i=0; i<ctx->nsamples; i++)
+        fprintf(stderr, "%f ", ctx->work.dm0ts[i]);
+      fprintf(stderr,"\n");
+      fprintf(stderr,"\n");
+      char tmp = getchar();
+
+      // Subtract from each channel
+      dbsvddb_subtract_0dm(client);
     }
-    //for(i=0; i<ctx->nW; i++)
-    //  fprintf(fp,"%f ", W[nproc][i]);
-    //fprintf(fp,"\n");
-
-    //fprintf(stderr,"%i %f %f %f %f %f %f\n",
-    //    nproc,W[nproc][0], data[ichan][0], U[nproc][0], Vt[nproc][0], PC[nproc][0],
-    //    outdata[ichan*nrows*ncols+1]);
-
   }
-  //fprintf(stderr,"\n");
-  //t = clock() - t;
-  //double time_taken = ((double) t)/CLOCKS_PER_SEC;
-  //fprintf(stderr,"Time: %lf \n",time_taken);
-  //fclose(fp);
-
-  /* 
-  // Validating
-  for(i=0; i<ctx->nW; i++)
-  {
-    for(nproc=0; nproc<ctx->nprocs; nproc++)
-    {
-      fprintf(stderr,"%f ",W[nproc][i]);
-    }
-    fprintf(stderr,"\n");
-  }
-  fprintf(stderr,"\n");
-  */ 
 
   // Write monitoring statistics
   if (ctx->write_monitoring)
@@ -992,7 +939,7 @@ int free_work(dada_client_t* client)
   // Freeing memory //
   ////////////////////
 
-  mopsr_dbsvddb_t* ctx = (mopsr_dbsvddb_t*) client->context;
+  dbsvddb_t* ctx = (dbsvddb_t*) client->context;
 
   multilog_t * log = client->log;
 
@@ -1001,7 +948,7 @@ int free_work(dada_client_t* client)
 
   FREE(ctx->eigs_zapped);
 
-  unsigned ichan,iproc;
+  unsigned ichan,iproc,ibeam;
   for (ichan=0; ichan<ctx->nchans; ichan++)
     FREE(ctx->work.data[ichan]);
 
@@ -1021,6 +968,8 @@ int free_work(dada_client_t* client)
   FREE(ctx->work.superb);
   FREE(ctx->work.info);
 
+  FREE(ctx->work.dm0ts);
+
   if (ctx->verbose)
     multilog (log, LOG_INFO, "free_work: memory freed\n");
 
@@ -1030,7 +979,7 @@ int free_work(dada_client_t* client)
 int malloc_work(dada_client_t* client)
 {
 
-  mopsr_dbsvddb_t* ctx = (mopsr_dbsvddb_t*) client->context;
+  dbsvddb_t* ctx = (dbsvddb_t*) client->context;
 
   multilog_t * log = client->log;
   uint64_t nrows = ctx->nbeams;
@@ -1040,7 +989,7 @@ int malloc_work(dada_client_t* client)
   if (ctx->verbose)
     multilog (log, LOG_INFO, "malloc_work: Allocating memory\n");
 
-  unsigned ichan,nproc;
+  unsigned ichan,ibeam,nproc;
 
 
   ctx->eigs_zapped = MALLOC(nchans*sizeof *(ctx->eigs_zapped));
@@ -1050,14 +999,14 @@ int malloc_work(dada_client_t* client)
   ctx->work.superb = MALLOC(ctx->nprocs* sizeof *(ctx->work.superb));
   ctx->work.PC = MALLOC(ctx->nprocs* sizeof *(ctx->work.PC));
   ctx->work.info = MALLOC(ctx->nprocs* sizeof *(ctx->work.info));
+  ctx->work.dm0ts = MALLOC(nrows*ncols * sizeof *(ctx->work.dm0ts));
 
   // Allocate memory for each process
   ctx->work.data = MALLOC(nchans*sizeof *(ctx->work.data));
 
-
-
   for (ichan=0; ichan<nchans; ichan++)
     ctx->work.data[ichan] = CALLOC(nrows*ncols,sizeof *(ctx->work.data[ichan]));
+
 
   // Output buffer
   ctx->work.outdata = MALLOC(nchans*nrows*ncols *sizeof *(ctx->work.outdata));
@@ -1234,16 +1183,279 @@ static inline int dbsvddb_get_neig(w_dtype* eigs, int total_eigs, int min_eigs, 
 }
 */
 
+void dbsvddb_do_svd(dada_client_t* client, w_dtype* data, int nproc, 
+    int nrows, int ncols, char jobu, char jobvt, 
+    lapack_int lddata, lapack_int ldu, lapack_int ldvt)
+{
+
+  dbsvddb_t* ctx = (dbsvddb_t*) client->context;
+
+#ifdef USEDOUBLE
+  ctx->work.info[nproc] = LAPACKE_dgesvd_work(LAPACK_ROW_MAJOR, jobu, jobvt,
+      nrows, ncols, data, lddata,
+      ctx->work.W[nproc], ctx->work.U[nproc], ldu,
+      ctx->work.Vt[nproc], ldvt, ctx->work.superb[nproc], ctx->work.lwork);
+#else
+  ctx->work.info[nproc] = LAPACKE_sgesvd_work(LAPACK_ROW_MAJOR, jobu, jobvt,
+      nrows, ncols, data, lddata,
+      ctx->work.W[nproc], ctx->work.U[nproc], ldu,
+      ctx->work.Vt[nproc], ldvt, ctx->work.superb[nproc], ctx->work.lwork);
+#endif
+}
+
+void dbsvddb_proj_pc(dada_client_t* client, w_dtype* outdata, int nproc,
+    int nrows, int ncols, char jobu, char jobvt, 
+    lapack_int lddata, lapack_int ldu, lapack_int ldvt)
+{
+
+  dbsvddb_t* ctx = (dbsvddb_t*) client->context;
+  // Compute Principal Components
+  if (nrows<ncols)
+  { 
+    // PC = dot(U.T,data)
+#ifdef USEDOUBLE
+    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+        nrows, ncols, MIN(nrows,ncols), 1.0, ctx->work.U[nproc], 
+        ldu, outdata, lddata, 0.0,
+        ctx->work.PC[nproc], lddata);
+#else
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+        nrows, ncols, MIN(nrows,ncols), 1.0, ctx->work.U[nproc], 
+        ldu, outdata, lddata, 0.0,
+        ctx->work.PC[nproc], lddata);
+#endif
+  }
+  else
+  {
+  // PC = dot(data,Vt.T) = dot(data,V)
+#ifdef USEDOUBLE
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+        nrows, ncols, MIN(nrows,ncols), 1.0, 
+        outdata, lddata, ctx->work.Vt[nproc],
+        ldvt, 0.0, ctx->work.PC[nproc], lddata);
+#else
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+        nrows, ncols, MIN(nrows,ncols), 1.0, 
+        outdata, lddata, ctx->work.Vt[nproc],
+        ldvt, 0.0, ctx->work.PC[nproc], lddata);
+#endif
+  }
+}
+
+
+void dbsvddb_unproj_pc(dada_client_t* client, w_dtype* outdata, int nproc, 
+    int nrows, int ncols, char jobu, char jobvt, 
+    lapack_int lddata, lapack_int ldu, lapack_int ldvt)
+{
+  dbsvddb_t* ctx = (dbsvddb_t*) client->context;
+
+  // Projecting back
+  if (nrows<ncols)
+  {
+  // outdata = dot(U,data)
+#ifdef USEDOUBLE
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        nrows, ncols, MIN(nrows,ncols), 1.0, ctx->work.U[nproc], ldu,
+        ctx->work.PC[nproc], lddata, 0.0, 
+        outdata, lddata);
+#else
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        nrows, ncols, MIN(nrows,ncols), 1.0, ctx->work.U[nproc], ldu,
+        ctx->work.PC[nproc], lddata, 0.0, 
+        outdata, lddata);
+#endif
+  }
+  else
+  {
+  // outdata = dot(Y, Vt)
+#ifdef USEDOUBLE
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        nrows, ncols, MIN(nrows,ncols), 1.0, ctx->work.PC[nproc], 
+        lddata, ctx->work.Vt[nproc], ldvt, 0.0, outdata, lddata);
+#else
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        nrows, ncols, MIN(nrows,ncols), 1.0, ctx->work.PC[nproc], 
+        lddata, ctx->work.Vt[nproc], ldvt, 0.0, outdata, lddata);
+#endif
+  }
+}
+
+void zero_first_k_eig(w_dtype* U, w_dtype* Vt, int neig, 
+    int nrows, int ncols)
+{
+  // Zeroing the first k eigenvectors (first k columns of U)
+  // (Or first k columns of Vt.T, i.e. first k rows of V)
+
+  int i,j;
+
+  for(i=0; i<MIN(nrows,ncols); i++)
+  {
+    for(j=0; j<neig; j++)
+    {
+      if (nrows<ncols)
+        U[i*MIN(nrows,ncols) + j] = 0.0;
+      else
+        Vt[j*MIN(nrows,ncols) + i] = 0.0;
+    }
+  }
+}
+
+
+void keep_first_k_eig(w_dtype* U, w_dtype* Vt, int neig, 
+    int nrows, int ncols)
+{
+  // keep the first k eigenvectors (first k columns of U)
+  // (Or first k columns of Vt.T, i.e. first k rows of V)
+  // and zero the rest
+
+  int i,j;
+
+  for(i=0; i<MIN(nrows,ncols); i++)
+  {
+    for(j=neig; j<MIN(nrows,ncols); j++)
+    {
+      if (nrows<ncols)
+        U[i*MIN(nrows,ncols) + j] = 0.0;
+      else
+        Vt[j*MIN(nrows,ncols) + i] = 0.0;
+    }
+  }
+}
+
 
 static inline int dbsvddb_get_neig(w_dtype* eigs, int total_eigs, 
     int min_eigs, float thresh)
 {
     int neigs_zap = 0;
     uint64_t i;
-    for (i=0; i <= (total_eigs - 1); i++)
+
+    for (i=0; i < (total_eigs - 1); i++)
     {
       if (eigs[i]/eigs[i+1] > thresh)
         neigs_zap += 1;
+      else
+        break;
     }
     return MIN(neigs_zap,min_eigs);
+}
+
+static inline w_dtype get_median(w_dtype* x, int nsamples) 
+{
+  uint64_t i,j;
+  w_dtype * temp_arr;
+  temp_arr = malloc(nsamples*sizeof (w_dtype));
+  for (i=0; i<nsamples; i++) 
+    temp_arr[i]=x[i];
+
+  w_dtype temp;
+  // the following two loops sort the array x in ascending order
+  for(i=0; i<nsamples-1; i++)
+  {
+    for(j=i+1; j<nsamples; j++) 
+    {          
+      if(temp_arr[j] < temp_arr[i]) 
+      {
+        // swap elements              
+        temp = temp_arr[i];
+        temp_arr[i] = temp_arr[j];
+        temp_arr[j] = temp;
+      }
+    }
+  }
+
+  if(nsamples%2==0) 
+  {
+    // if there is an even number of elements, return mean of the two elements in the middle
+    temp = (temp_arr[nsamples/2] + temp_arr[nsamples/2 - 1]) / 2.0;
+    free(temp_arr);
+    return(temp);
+  } 
+  else 
+  {
+    // else return the element in the middle
+    temp = x[nsamples/2];
+    free(temp_arr);
+    return temp;
+  }
+}
+
+static inline void get_median_mad(w_dtype* time_series, int nsamples, w_dtype *md, w_dtype *mad)
+{
+  uint64_t i;
+  w_dtype t_median = get_median(time_series, nsamples);
+  w_dtype* temp;
+  temp = malloc(nsamples * sizeof(w_dtype));
+  for (i=0; i<nsamples; i++)
+    temp[i] = fabs(t_median - time_series[i]);
+
+  *md = t_median;
+  *mad = get_median(temp,nsamples);
+  free(temp);
+}
+
+
+static inline void dbsvddb_standardise(dada_client_t* client, uint64_t ibeam)
+{
+  // Normalise each time series //
+
+  dbsvddb_t* ctx = (dbsvddb_t*) client->context;
+
+  w_dtype median, mad;
+
+  uint64_t i;
+  get_median_mad(&(ctx->work.dm0ts[ibeam*ctx->nsamples]), ctx->nsamples, &median, &mad);
+
+  for (i=0; i<ctx->nsamples; i++)
+  {
+    ctx->work.dm0ts[ibeam*ctx->nsamples + i] = 
+      (ctx->work.dm0ts[ibeam*ctx->nsamples + i] - median)/(1.4826*mad);
+  }
+}
+
+
+
+
+
+static inline void dbsvddb_dm0_scr(dada_client_t* client)
+{
+  // Produce dm0ts from outdata pointer //
+  dbsvddb_t* ctx = (dbsvddb_t*) client->context;
+
+  uint64_t ichan, ibeam, isamp;
+  char tmp;
+
+  memset(ctx->work.dm0ts, 0., 
+      ctx->nsamples*ctx->nbeams*sizeof *ctx->work.dm0ts);
+//#pragma omp parallel for private(isamp,ichan)
+  for (ibeam=0; ibeam<ctx->nbeams; ibeam++)
+  {
+    for (isamp=0; isamp<ctx->nsamples; isamp++)
+    {
+      // Frequency scrunch
+      for (ichan=0; ichan<ctx->nchans; ichan++)
+        ctx->work.dm0ts[ibeam*ctx->nsamples + isamp] += 
+          ctx->work.outdata[ichan*ctx->nbeams*ctx->nsamples + ibeam*ctx->nsamples + isamp];
+    }
+    // Remove baseline and normalise
+    dbsvddb_standardise(client, ibeam);
+  }
+
+}
+
+
+static inline void dbsvddb_subtract_0dm(dada_client_t* client)
+{
+  dbsvddb_t* ctx = (dbsvddb_t*) client->context;
+
+  uint64_t ichan, ibeam, isamp;
+
+  for (ibeam=0; ibeam<ctx->nbeams; ibeam++)
+  {
+    for (isamp=0; isamp<ctx->nsamples; isamp++)
+    {
+      for (ichan=0; ichan<ctx->nchans; ichan++)
+        ctx->work.outdata[ichan*ctx->nbeams*ctx->nsamples + ibeam*ctx->nsamples + isamp] -=
+          ctx->work.dm0ts[ibeam*ctx->nsamples + isamp];
+    }
+  }
 }
