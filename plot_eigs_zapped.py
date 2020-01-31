@@ -1,4 +1,4 @@
-rc_params = {"figure.figsize": (14,12),
+rc_params = {"figure.figsize": (18,12),
              "xtick.major.size": 9,
              "xtick.minor.size": 4,
              "ytick.major.size": 9,
@@ -59,15 +59,16 @@ def main(args):
     ax1 = plt.subplot(gs[0])
     d = data.mean(axis=1)
     ax1.plot(d,range(NCHANS))
-    ax1.set_xlabel("Mean eigvec zapped")
+    ax1.set_xlabel("Mean")
     ax1.set_ylabel("Frequency channel index")
-    ax1.set_xticks(range(0,int(np.max(d))+1,2))
+    #ax1.set_xticks(range(0,int(np.max(d))+1,1))
     ax1.tick_params()
     ax1.set_ylim(0,NCHANS-1)
 
     ax2 = plt.subplot(gs[1])
     a = ax2.imshow(np.flipud(data),interpolation='nearest',aspect='auto')
-    ax2.set_xlabel("Block index")
+    if not dm0_exists:
+        ax2.set_xlabel("Block index")
     ax2.tick_params()
     ax2.set_yticklabels([])
     cbar = plt.colorbar(a,ax=ax2)
